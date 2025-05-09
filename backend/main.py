@@ -8,11 +8,10 @@ from transformers import pipeline
 import faiss
 import numpy as np
 import os
-import tempfile
 import shutil
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -20,11 +19,7 @@ import json
 import requests
 from icalendar import Calendar, Event
 import pytz
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.vectorstores.faiss import FAISS
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains import RetrievalQA
-from langchain.llms import OpenAI as LangChainOpenAI
+import io
 
 app = FastAPI()
 
@@ -78,7 +73,7 @@ class CaseMetadata(BaseModel):
 case_metadata: Dict[int, CaseMetadata] = {}
 
 class NotificationSettings(BaseModel):
-    email: EmailStr
+    email: str
     notify_before_hearing: int = 24  # hours
     notify_case_updates: bool = True
     notify_related_cases: bool = True
@@ -86,32 +81,34 @@ class NotificationSettings(BaseModel):
 # Store notification settings
 notification_settings: Dict[int, NotificationSettings] = {}
 
-openai.api_key = "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"
+# Configure OpenAI API
+openai.api_key = "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"
 openai.api_base = "https://openrouter.ai/api/v1"
 
 def extract_text_from_pdf(file_bytes):
-    # Try digital extraction first
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(file_bytes)
-        tmp.flush()
-        try:
-            with pdfplumber.open(tmp.name) as pdf:
-                text = "\n".join(page.extract_text() or "" for page in pdf.pages)
-                if not text.strip():
-                    # If digital extraction fails, try OCR
-                    images = convert_from_bytes(file_bytes)
-                    text = ""
-                    for img in images:
-                        text += pytesseract.image_to_string(img)
-        except Exception as e:
-            print(f"Error in PDF extraction: {str(e)}")
-            # Fallback to OCR
-            images = convert_from_bytes(file_bytes)
-            text = ""
-            for img in images:
-                text += pytesseract.image_to_string(img)
-        finally:
-            os.unlink(tmp.name)
+    # Extract text directly from bytes without using temporary files
+    try:
+        # Use BytesIO instead of temporary file
+        with io.BytesIO(file_bytes) as pdf_file:
+            try:
+                with pdfplumber.open(pdf_file) as pdf:
+                    text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+                    if not text.strip():
+                        # If digital extraction fails, try OCR
+                        images = convert_from_bytes(file_bytes)
+                        text = ""
+                        for img in images:
+                            text += pytesseract.image_to_string(img)
+            except Exception as e:
+                print(f"Error in PDF extraction: {str(e)}")
+                # Fallback to OCR
+                images = convert_from_bytes(file_bytes)
+                text = ""
+                for img in images:
+                    text += pytesseract.image_to_string(img)
+    except Exception as e:
+        print(f"Error processing PDF: {str(e)}")
+        text = ""
     return text
 
 def summarize_text(text, style="default"):
@@ -140,7 +137,7 @@ Text: {text[:3000]}"""
             prompt = f"Summarize the following legal case in 5 sentences:\n\n{text[:3000]}"
 
         response = openai.ChatCompletion.create(
-            model="openai/gpt-3.5-turbo",
+            model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=500 if style == "detailed" else 200
         )
@@ -153,7 +150,7 @@ def get_embedding(text):
     try:
         response = openai.Embedding.create(
             input=text[:3000],
-            model="openai/text-embedding-ada-002"
+            model="text-embedding-ada-002"
         )
         return np.array(response.data[0].embedding, dtype=np.float32)
     except Exception as e:
@@ -184,7 +181,7 @@ Format the response as a JSON object with these fields.
 Text: {text[:3000]}"""
 
         response = openai.ChatCompletion.create(
-            model="openai/gpt-3.5-turbo",
+            model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=300
         )
@@ -548,37 +545,44 @@ def sync_with_court_system(case_id: int):
     else:
         raise HTTPException(status_code=500, detail="Failed to sync with court system")
 
-# Build LangChain vector store from in-memory documents
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-
-def build_vector_store():
-    if not documents:
-        return None, None
-    texts = []
-    metadatas = []
-    for idx, doc in enumerate(documents):
-        for chunk in text_splitter.split_text(doc):
-            texts.append(chunk)
-            metadatas.append({"doc_id": idx})
-    embeddings = OpenAIEmbeddings(openai_api_key=openai.api_key, openai_api_base=openai.api_base)
-    vectorstore = FAISS.from_texts(texts, embeddings, metadatas=metadatas)
-    retriever = vectorstore.as_retriever()
-    return retriever, vectorstore
-
 @app.get("/rag_qa/")
 def rag_qa(query: str = Query(...)):
     if not documents:
         return {"answer": "No documents uploaded yet."}
-    retriever, _ = build_vector_store()
-    if retriever is None:
-        return {"answer": "No documents available for retrieval."}
-    llm = LangChainOpenAI(openai_api_key=openai.api_key, openai_api_base=openai.api_base, temperature=0)
-    qa_chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, return_source_documents=True)
-    result = qa_chain({"query": query})
-    answer = result["result"]
-    # Optionally, show the most relevant context
-    context = "\n---\n".join([doc.page_content for doc in result.get("source_documents", [])])
-    return {"answer": answer, "context": context}
+        
+    # Use direct OpenAI API for simpler implementation
+    try:
+        # Find the most relevant document using embeddings
+        query_emb = get_embedding(query)
+        D, I = faiss_index.search(np.array([query_emb]), k=3)
+        
+        # Combine the top documents
+        context = ""
+        for idx in I[0]:
+            if idx < len(documents):
+                # Add a portion of each document
+                context += documents[idx][:1000] + "\n\n"
+        
+        prompt = f"""Answer the following question based only on the provided context:
+
+Context:
+{context[:3000]}
+
+Question: {query}
+
+Answer:"""
+
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=300
+        )
+        answer = response.choices[0].message.content.strip()
+        
+        return {"answer": answer, "context": context[:500] + "..." if len(context) > 500 else context}
+    except Exception as e:
+        print(f"Error in RAG QA: {str(e)}")
+        return {"answer": f"Error generating answer: {str(e)}", "context": ""}
 
 @app.get("/case_features/")
 def case_features():
@@ -595,3 +599,8 @@ def case_features():
             "next_hearing": meta.next_hearing
         })
     return features
+
+# Run the server when the script is executed directly
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
